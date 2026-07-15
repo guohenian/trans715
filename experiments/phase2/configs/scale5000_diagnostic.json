@@ -18,6 +18,7 @@
   "dropout": 0.0,
   "pre_ln": false,
   "max_steps": 3000,
+  "checkpoint_policy": "best_and_last",
   "lr": 0.0001,
   "weight_decay": 0.0,
   "scheduled_sampling_max": 0.0,

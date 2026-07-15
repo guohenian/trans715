@@ -30,7 +30,7 @@ def test_one_step_training_checkpoint_and_prediction_output(tmp_path: Path):
         epochs=1, batch_size=1, eval_batch_size=1, device="cpu", max_steps=1,
         d_model=16, nhead=4, num_layers=1, dim_feedforward=32, dropout=0.0,
         weight_decay=0.0, scheduled_sampling_max=0.0, max_source_len=32, max_target_len=32,
-        show_progress=False,
+        checkpoint_policy="best_and_last", show_progress=False,
     )
     predictions = tmp_path / "predictions.jsonl"
     metrics = evaluate_full_greedy_from_config(
@@ -39,6 +39,9 @@ def test_one_step_training_checkpoint_and_prediction_output(tmp_path: Path):
     )
 
     assert checkpoint.exists()
+    assert checkpoint.name == "checkpoint_last.pt"
+    assert (output_dir / "checkpoint_best.pt").exists()
+    assert not (output_dir / "checkpoint_epoch_1.pt").exists()
     assert predictions.exists()
     assert metrics["sample_count"] == 2
     saved = torch.load(checkpoint, map_location="cpu")

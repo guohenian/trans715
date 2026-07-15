@@ -11,3 +11,5 @@
 5. 人工比较第一阶段基线后创建相应 `*-reviewed` 标记，再决定是否运行 Pre-LN 和 larger。
 
 RTX 5090 使用 `--precision bf16`。脚本发现缺少前置审核标记时会退出，不会自动串联后续实验。
+
+两个诊断实验使用 `best_and_last` checkpoint 策略，只保留 `checkpoint_best.pt` 和 `checkpoint_last.pt`，避免 3000-step 诊断保存 137 份完整 checkpoint 耗尽服务器磁盘。

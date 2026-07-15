@@ -437,8 +437,11 @@ def train_from_config(
     show_progress: bool = DEFAULT_PROGRESS,
     precision: str = "auto",
     use_amp: bool | None = None,
+    checkpoint_policy: str = "all",
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
+    if checkpoint_policy not in {"all", "last", "best_and_last"}:
+        raise ValueError(f"Unsupported checkpoint policy: {checkpoint_policy}")
     _seed_everything(seed)
     resolved_device = _resolve_device(device)
     if use_amp is not None and not use_amp:
@@ -535,6 +538,7 @@ def train_from_config(
         "seed": seed,
         "precision_requested": precision,
         "precision_resolved": precision_policy.mode,
+        "checkpoint_policy": checkpoint_policy,
         **model_config,
     }
     config_bytes = json.dumps(training_config, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -560,42 +564,48 @@ def train_from_config(
         else:
             warnings.warn("Legacy checkpoint has no random state; resumed batches are not exactly reproducible")
     if _training_limit_reached(global_step, max_steps):
-        return resume_from or (output_dir / f"checkpoint_epoch_{start_epoch}.pt")
+        return resume_from or (output_dir / ("checkpoint_last.pt" if checkpoint_policy != "all" else f"checkpoint_epoch_{start_epoch}.pt"))
 
     def save_checkpoint(path: Path, epoch: int, avg_loss: float) -> None:
-        torch.save(
-            {
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "model_config": model_config,
-                "epoch": epoch,
-                "loss": avg_loss,
-                "dataset_path": str(dataset_path),
-                "max_source_len": max_source_len,
-                "max_target_len": max_target_len,
-                "skipped_too_long": dataset.skipped_too_long,
-                "global_step": global_step,
-                "eos_loss_weight": eos_loss_weight,
-                "length_loss_weight": length_loss_weight,
-                "seed": seed,
-                "scheduler": {
-                    "warmup": warmup_scheduler.state_dict(),
-                    "cosine": cosine_scheduler.state_dict(),
-                },
-                "precision": precision_policy.mode,
-                "training_config": training_config,
-                "training_config_sha256": training_config_sha256,
-                "random_state": _capture_random_state(loader_generator),
+        payload = {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "model_config": model_config,
+            "epoch": epoch,
+            "loss": avg_loss,
+            "dataset_path": str(dataset_path),
+            "max_source_len": max_source_len,
+            "max_target_len": max_target_len,
+            "skipped_too_long": dataset.skipped_too_long,
+            "global_step": global_step,
+            "eos_loss_weight": eos_loss_weight,
+            "length_loss_weight": length_loss_weight,
+            "seed": seed,
+            "scheduler": {
+                "warmup": warmup_scheduler.state_dict(),
+                "cosine": cosine_scheduler.state_dict(),
             },
-            path,
-        )
+            "precision": precision_policy.mode,
+            "training_config": training_config,
+            "training_config_sha256": training_config_sha256,
+            "random_state": _capture_random_state(loader_generator),
+        }
+        with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".tmp", delete=False) as handle:
+            temporary = Path(handle.name)
+        try:
+            torch.save(payload, temporary)
+            temporary.replace(path)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
 
     _log(
         f"Training: epochs={epochs} batch_size={batch_size} eval_batch_size={resolved_eval_batch_size} "
         f"num_workers={num_workers} len={len(dataset)} steps/epoch~{len(dataset)//batch_size} "
         f"device={resolved_device} precision={precision_policy.mode}"
     )
-    checkpoint_path = output_dir / "checkpoint_epoch_0.pt"
+    checkpoint_path = output_dir / ("checkpoint_last.pt" if checkpoint_policy != "all" else "checkpoint_epoch_0.pt")
+    best_score = float("-inf")
     for epoch in range(start_epoch, epochs):
         if _training_limit_reached(global_step, max_steps):
             break
@@ -735,6 +745,7 @@ def train_from_config(
         _append_metric(metrics_path, metric_payload)
         print(json.dumps(metric_payload, ensure_ascii=False), flush=True)
 
+        evaluation_score = train_exact["greedy_exact_match_rate"]
         if test_dataset is not None and test_loader is not None:
             test_exact = compute_exact_match_rate(
                 model,
@@ -769,12 +780,19 @@ def train_from_config(
             }
             _append_metric(metrics_path, test_payload)
             print(json.dumps(test_payload, ensure_ascii=False), flush=True)
+            evaluation_score = test_exact["greedy_exact_match_rate"]
         if epoch < warmup_epochs:
             warmup_scheduler.step()
         else:
             cosine_scheduler.step()
-        checkpoint_path = output_dir / f"checkpoint_epoch_{epoch + 1}.pt"
+        if checkpoint_policy == "all":
+            checkpoint_path = output_dir / f"checkpoint_epoch_{epoch + 1}.pt"
+        else:
+            checkpoint_path = output_dir / "checkpoint_last.pt"
         save_checkpoint(checkpoint_path, epoch + 1, avg_loss)
+        if checkpoint_policy == "best_and_last" and evaluation_score > best_score:
+            best_score = evaluation_score
+            save_checkpoint(output_dir / "checkpoint_best.pt", epoch + 1, avg_loss)
         if max_steps is not None and global_step >= max_steps:
             break
 
