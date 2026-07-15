@@ -17,6 +17,7 @@ env/
 .claude/
 .codex/
 .superpowers/
+.worktrees/
 
 # Operating-system files
 .DS_Store
@@ -46,4 +47,3 @@ Desktop.ini
 *.temp
 *.partial
 *.bak
-
