@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import random
 import sys
+import tempfile
+import warnings
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
@@ -43,6 +47,73 @@ DEFAULT_METRIC_PROGRESS_EVERY = 0
 DEFAULT_NUM_WORKERS = 0
 DEFAULT_PROGRESS = True
 DEFAULT_SEED = 20260713
+
+
+@dataclass(frozen=True)
+class PrecisionPolicy:
+    mode: str
+    autocast_enabled: bool
+    autocast_dtype: torch.dtype | None
+
+
+class NonFiniteTrainingError(RuntimeError):
+    pass
+
+
+def resolve_precision_mode(requested: str, device: str) -> PrecisionPolicy:
+    if requested not in {"auto", "bf16", "fp32"}:
+        raise ValueError(f"Unsupported precision mode: {requested}")
+    is_cuda = str(device).startswith("cuda")
+    bf16_supported = is_cuda and torch.cuda.is_bf16_supported()
+    if requested == "bf16" and not bf16_supported:
+        raise RuntimeError("BF16 precision requires a CUDA device with BF16 support")
+    if requested == "bf16" or (requested == "auto" and bf16_supported):
+        return PrecisionPolicy("bf16", True, torch.bfloat16)
+    return PrecisionPolicy("fp32", False, None)
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, allow_nan=False)
+        handle.write("\n")
+        temporary = Path(handle.name)
+    temporary.replace(path)
+
+
+def ensure_finite_tensor(
+    value: torch.Tensor,
+    stage: str,
+    output_dir: Path,
+    context: dict,
+) -> None:
+    if bool(torch.isfinite(value).all().item()):
+        return
+    report = {**context, "failure_stage": stage}
+    _write_json_atomic(output_dir / "failure.json", report)
+    raise NonFiniteTrainingError(f"Non-finite value detected during {stage}")
+
+
+def _capture_random_state(dataloader_generator: torch.Generator | None = None) -> dict:
+    state = {"python": random.getstate(), "torch_cpu": torch.get_rng_state()}
+    if dataloader_generator is not None:
+        state["dataloader"] = dataloader_generator.get_state()
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_random_state(state: dict, dataloader_generator: torch.Generator | None = None) -> None:
+    random.setstate(state["python"])
+    torch.set_rng_state(state["torch_cpu"])
+    if torch.cuda.is_available() and "torch_cuda" in state:
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+    if dataloader_generator is not None and "dataloader" in state:
+        dataloader_generator.set_state(state["dataloader"])
+
+
+def _parameters_are_finite(model: nn.Module) -> bool:
+    return all(bool(torch.isfinite(parameter).all().item()) for parameter in model.parameters())
 
 
 def _seed_everything(seed: int) -> None:
@@ -364,11 +435,15 @@ def train_from_config(
     metric_progress_every: int = DEFAULT_METRIC_PROGRESS_EVERY,
     num_workers: int = DEFAULT_NUM_WORKERS,
     show_progress: bool = DEFAULT_PROGRESS,
-    use_amp: bool = True,
+    precision: str = "auto",
+    use_amp: bool | None = None,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     _seed_everything(seed)
     resolved_device = _resolve_device(device)
+    if use_amp is not None and not use_amp:
+        precision = "fp32"
+    precision_policy = resolve_precision_mode(precision, resolved_device)
 
     dataset = TokenJsonlDataset(
         dataset_path,
@@ -435,7 +510,6 @@ def train_from_config(
     cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=epochs - warmup_epochs, eta_min=1e-5
     )
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     class_weights = torch.ones(bpe_vocab.vocab_size, dtype=torch.float, device=resolved_device)
     class_weights[TOKEN_EOS] = eos_loss_weight
     loss_fn = nn.CrossEntropyLoss(ignore_index=TOKEN_PAD, weight=class_weights)
@@ -443,6 +517,32 @@ def train_from_config(
     global_step = 0
     start_epoch = 0
     metrics_path = output_dir / "metrics.jsonl"
+    training_config = {
+        "dataset_path": str(dataset_path),
+        "test_dataset_path": str(resolved_test_dataset),
+        "vocab_path": str(vocab_path or _default_vocab_path(dataset_path)),
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "eval_batch_size": resolved_eval_batch_size,
+        "lr": lr,
+        "max_source_len": max_source_len,
+        "max_target_len": max_target_len,
+        "eos_loss_weight": eos_loss_weight,
+        "length_loss_weight": length_loss_weight,
+        "weight_decay": weight_decay,
+        "scheduled_sampling_max": scheduled_sampling_max,
+        "max_steps": max_steps,
+        "seed": seed,
+        "precision_requested": precision,
+        "precision_resolved": precision_policy.mode,
+        **model_config,
+    }
+    config_bytes = json.dumps(training_config, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    training_config_sha256 = hashlib.sha256(config_bytes).hexdigest()
+    _write_json_atomic(
+        output_dir / "resolved_config.json",
+        {**training_config, "sha256": training_config_sha256},
+    )
 
     if resume_from is not None:
         payload = torch.load(resume_from, map_location=resolved_device)
@@ -450,6 +550,15 @@ def train_from_config(
         optimizer.load_state_dict(payload["optimizer"])
         start_epoch = int(payload.get("epoch", 0))
         global_step = int(payload.get("global_step", 0))
+        if "scheduler" in payload:
+            warmup_scheduler.load_state_dict(payload["scheduler"]["warmup"])
+            cosine_scheduler.load_state_dict(payload["scheduler"]["cosine"])
+        else:
+            warnings.warn("Legacy checkpoint has no scheduler state; resumed learning rate may differ")
+        if "random_state" in payload:
+            _restore_random_state(payload["random_state"], loader_generator)
+        else:
+            warnings.warn("Legacy checkpoint has no random state; resumed batches are not exactly reproducible")
     if _training_limit_reached(global_step, max_steps):
         return resume_from or (output_dir / f"checkpoint_epoch_{start_epoch}.pt")
 
@@ -469,13 +578,22 @@ def train_from_config(
                 "eos_loss_weight": eos_loss_weight,
                 "length_loss_weight": length_loss_weight,
                 "seed": seed,
+                "scheduler": {
+                    "warmup": warmup_scheduler.state_dict(),
+                    "cosine": cosine_scheduler.state_dict(),
+                },
+                "precision": precision_policy.mode,
+                "training_config": training_config,
+                "training_config_sha256": training_config_sha256,
+                "random_state": _capture_random_state(loader_generator),
             },
             path,
         )
 
     _log(
         f"Training: epochs={epochs} batch_size={batch_size} eval_batch_size={resolved_eval_batch_size} "
-        f"num_workers={num_workers} len={len(dataset)} steps/epoch~{len(dataset)//batch_size} device={resolved_device}"
+        f"num_workers={num_workers} len={len(dataset)} steps/epoch~{len(dataset)//batch_size} "
+        f"device={resolved_device} precision={precision_policy.mode}"
     )
     checkpoint_path = output_dir / "checkpoint_epoch_0.pt"
     for epoch in range(start_epoch, epochs):
@@ -498,7 +616,9 @@ def train_from_config(
             labels = _to_device(labels, resolved_device)
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast("cuda", enabled=use_amp):
+            with torch.amp.autocast(
+                "cuda", enabled=precision_policy.autocast_enabled, dtype=precision_policy.autocast_dtype
+            ):
                 logits = model(source, decoder_input)
                 if scheduled_p > 0:
                     with torch.no_grad():
@@ -509,7 +629,9 @@ def train_from_config(
                     mask = mask & decoder_input.ne(TOKEN_PAD)
                     if mask.any():
                         mixed = torch.where(mask, pred_shifted, decoder_input)
-                        with torch.amp.autocast("cuda", enabled=use_amp):
+                        with torch.amp.autocast(
+                            "cuda", enabled=precision_policy.autocast_enabled, dtype=precision_policy.autocast_dtype
+                        ):
                             logits = model(source, mixed)
                 token_loss = loss_fn(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
                 if length_loss_weight > 0:
@@ -521,11 +643,30 @@ def train_from_config(
                     loss = token_loss + (length_loss_weight * eos_loss)
                 else:
                     loss = token_loss
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            failure_context = {
+                "epoch": epoch + 1,
+                "global_step": global_step,
+                "batch_index": step_index,
+                "source_max_len": int(source.size(1)),
+                "target_max_len": int(labels.size(1)),
+                "precision": precision_policy.mode,
+                "learning_rate": float(optimizer.param_groups[0]["lr"]),
+            }
+            try:
+                ensure_finite_tensor(loss.detach(), "loss", output_dir, failure_context)
+                loss.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                ensure_finite_tensor(grad_norm.detach(), "gradient_norm", output_dir, failure_context)
+            except NonFiniteTrainingError:
+                optimizer.zero_grad(set_to_none=True)
+                if _parameters_are_finite(model):
+                    save_checkpoint(
+                        output_dir / "checkpoint_last_finite.pt",
+                        epoch,
+                        total_loss / max(1, completed_steps),
+                    )
+                raise
+            optimizer.step()
 
             total_loss += float(loss.item())
             completed_steps += 1
@@ -542,9 +683,19 @@ def train_from_config(
             if max_steps is not None and global_step >= max_steps:
                 break
 
-        checkpoint_path = output_dir / f"checkpoint_epoch_{epoch + 1}.pt"
         avg_loss = _average_completed_loss(total_loss, completed_steps)
-        save_checkpoint(checkpoint_path, epoch + 1, avg_loss)
+        if not _parameters_are_finite(model):
+            parameter_context = {
+                "epoch": epoch + 1,
+                "global_step": global_step,
+                "precision": precision_policy.mode,
+                "learning_rate": float(optimizer.param_groups[0]["lr"]),
+            }
+            _write_json_atomic(
+                output_dir / "failure.json",
+                {**parameter_context, "failure_stage": "model_parameters"},
+            )
+            raise NonFiniteTrainingError("Non-finite model parameter detected after optimizer update")
         train_exact = compute_exact_match_rate(
             model,
             metric_loader,
@@ -579,6 +730,7 @@ def train_from_config(
             "teacher_forced_token_count": train_token["teacher_forced_token_count"],
             "skipped_too_long": dataset.skipped_too_long,
             "global_step": global_step,
+            "training_config_sha256": training_config_sha256,
         }
         _append_metric(metrics_path, metric_payload)
         print(json.dumps(metric_payload, ensure_ascii=False), flush=True)
@@ -613,6 +765,7 @@ def train_from_config(
                 "teacher_forced_token_count": test_token["teacher_forced_token_count"],
                 "skipped_too_long": test_dataset.skipped_too_long,
                 "global_step": global_step,
+                "training_config_sha256": training_config_sha256,
             }
             _append_metric(metrics_path, test_payload)
             print(json.dumps(test_payload, ensure_ascii=False), flush=True)
@@ -620,6 +773,8 @@ def train_from_config(
             warmup_scheduler.step()
         else:
             cosine_scheduler.step()
+        checkpoint_path = output_dir / f"checkpoint_epoch_{epoch + 1}.pt"
+        save_checkpoint(checkpoint_path, epoch + 1, avg_loss)
         if max_steps is not None and global_step >= max_steps:
             break
 
@@ -708,7 +863,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--dim-feedforward", type=int, default=DEFAULT_MODEL_DIM_FEEDFORWARD)
     parser.add_argument("--dropout", type=float, default=DEFAULT_MODEL_DROPOUT)
     parser.add_argument("--pre-ln", action="store_true")
-    parser.add_argument("--no-amp", dest="use_amp", action="store_false", help="Disable automatic mixed precision")
+    parser.add_argument("--precision", choices=["auto", "bf16", "fp32"], default="auto")
+    parser.add_argument("--no-amp", action="store_true", help="Deprecated alias for --precision fp32")
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--scheduled-sampling-max", type=float, default=0.25)
     parser.add_argument("--max-steps", type=int, default=None)
@@ -762,7 +918,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         metric_progress_every=args.metric_progress_every,
         num_workers=args.num_workers,
         show_progress=args.show_progress,
-        use_amp=args.use_amp,
+        precision="fp32" if args.no_amp else args.precision,
     )
     print(checkpoint)
 

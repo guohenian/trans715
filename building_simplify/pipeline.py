@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import shutil
+import sys
 import tempfile
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -492,6 +493,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     for command in ("train-baseline", "train-diagnostic"):
         train = subparsers.add_parser(command)
+        train.add_argument("--config", type=Path, default=None)
         train.add_argument("--datasets-root", type=Path, default=Path("datasets"))
         train.add_argument("--scale", type=int, choices=[5000, 10000], required=True)
         train.add_argument("--output-dir", type=Path, required=True)
@@ -507,7 +509,11 @@ def build_parser() -> argparse.ArgumentParser:
         train.add_argument("--dropout", type=float, default=0.1 if command == "train-baseline" else 0.0)
         train.add_argument("--pre-ln", action="store_true")
         train.add_argument("--max-steps", type=int, default=None if command == "train-baseline" else 3000)
-        train.add_argument("--no-amp", dest="use_amp", action="store_false", help="Disable automatic mixed precision")
+        train.add_argument("--precision", choices=["auto", "bf16", "fp32"], default="auto")
+        train.add_argument("--no-amp", action="store_true", help="Deprecated alias for --precision fp32")
+        train.add_argument("--lr", type=float, default=1e-4)
+        train.add_argument("--weight-decay", type=float, default=0.0 if command == "train-diagnostic" else 0.01)
+        train.add_argument("--scheduled-sampling-max", type=float, default=0.0 if command == "train-diagnostic" else 0.25)
 
     evaluate = subparsers.add_parser("evaluate")
     evaluate.add_argument("--predictions", type=Path, required=True)
@@ -523,8 +529,34 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    values = list(argv) if argv is not None else sys.argv[1:]
+    parser = build_parser()
+    if not values or values[0] not in {"train-baseline", "train-diagnostic"} or "--config" not in values:
+        return parser.parse_args(values)
+    config_index = values.index("--config")
+    if config_index + 1 >= len(values):
+        return parser.parse_args(values)
+    config_path = Path(values[config_index + 1])
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    choices = parser._subparsers._group_actions[0].choices
+    subparser = choices[values[0]]
+    valid_destinations = {action.dest for action in subparser._actions}
+    metadata = {"command", "name", "requires"}
+    unknown = set(config) - valid_destinations - metadata
+    if unknown:
+        raise ValueError(f"Unknown training config keys: {sorted(unknown)}")
+    path_fields = {"datasets_root", "output_dir"}
+    defaults = {key: Path(value) if key in path_fields else value for key, value in config.items() if key in valid_destinations}
+    for action in subparser._actions:
+        if action.dest in defaults:
+            action.required = False
+    subparser.set_defaults(**defaults)
+    return parser.parse_args(values)
+
+
 def main(argv: list[str] | None = None) -> None:
-    args = build_parser().parse_args(argv)
+    args = parse_args(argv)
     if args.command == "prepare-all":
         root = args.output_root if args.output_root.is_absolute() else args.workspace / args.output_root
         report = prepare_all(
@@ -539,6 +571,8 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps({"output_root": report["output_root"], "scales": sorted(report["scales"])}, ensure_ascii=False, indent=2))
         return
     if args.command in {"train-baseline", "train-diagnostic"}:
+        if args.no_amp and args.precision != "auto":
+            raise ValueError("--no-amp cannot be combined with an explicit --precision value")
         layout = DatasetLayout(args.datasets_root.resolve(), args.scale)
         diagnostic = args.command == "train-diagnostic"
         dataset = layout.diagnostic_bpe if diagnostic else layout.train_bpe
@@ -560,9 +594,10 @@ def main(argv: list[str] | None = None) -> None:
             dim_feedforward=args.dim_feedforward,
             dropout=args.dropout,
             pre_ln=args.pre_ln,
-            weight_decay=0.0 if diagnostic else 0.01,
-            scheduled_sampling_max=0.0 if diagnostic else 0.25,
-            use_amp=args.use_amp,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            scheduled_sampling_max=args.scheduled_sampling_max,
+            precision="fp32" if args.no_amp else args.precision,
         )
         print(checkpoint)
         return

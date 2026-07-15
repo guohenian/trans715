@@ -37,12 +37,22 @@ Completed projection and scale manifests are hash-checked and reused. Pass `--fo
 
 ## 2. Train baseline and diagnostic models
 
+### Precision policy
+
+Training accepts `--precision auto|bf16|fp32`. `auto` selects BF16 only on a CUDA device that reports BF16 support and otherwise uses FP32. FP16 is intentionally not used. On the RTX 5090 server, use BF16 explicitly:
+
+```bash
+--device cuda --precision bf16
+```
+
+The trainer checks every loss and gradient norm for NaN/Inf. A failure writes `failure.json`, saves `checkpoint_last_finite.pt` when model parameters are still finite, and stops immediately. Epoch checkpoints contain optimizer, both learning-rate schedulers, random states, resolved precision and the full training configuration.
+
 Unchanged Post-LN baseline:
 
 ```bash
 python -m building_simplify.pipeline train-baseline \
   --datasets-root datasets --scale 5000 \
-  --output-dir runs/scale5000/baseline --device cuda
+  --output-dir runs/scale5000/baseline --device cuda --precision bf16
 ```
 
 Fixed 512-complex-sample overfit diagnostic (`dropout=0`, weight decay and scheduled sampling disabled, maximum 3000 steps):
@@ -50,10 +60,18 @@ Fixed 512-complex-sample overfit diagnostic (`dropout=0`, weight decay and sched
 ```bash
 python -m building_simplify.pipeline train-diagnostic \
   --datasets-root datasets --scale 5000 \
-  --output-dir runs/scale5000/diagnostic --device cuda
+  --output-dir runs/scale5000/diagnostic --device cuda --precision bf16
 ```
 
 Repeat for scale 10000. The diagnostic gate is teacher-forced accuracy >= 0.995 and greedy exact >= 0.98. After it passes, use `train-baseline` with one explicit change at a time, such as `--dropout 0`, `--pre-ln`, or the larger capacity arguments.
+
+For the isolated 1:5000 phase-two workflow, run only the first script initially:
+
+```bash
+bash experiments/phase2/scripts/run_diagnostic_5000.sh
+```
+
+After reviewing the diagnostic metrics, create the documented approval marker and run `run_dropout0_5000.sh`. Pre-LN and larger-model scripts also require their previous experiment's review marker. Configurations, commands and acceptance gates are documented in `experiments/phase2/README.md`; outputs remain under ignored `experiments/phase2/runs/`.
 
 ## 3. Evaluate frozen predictions
 

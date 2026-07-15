@@ -1,0 +1,9 @@
+{
+  "scale": 5000,
+  "status": "temporary_baseline",
+  "best_epoch": 5,
+  "validation_greedy_exact": 0.26282932283537935,
+  "validation_teacher_forced_token_accuracy": 0.875145019365663,
+  "checkpoint_filename": "checkpoint_best_epoch5.pt",
+  "invalid_from_epoch": 8
+}

@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import torch
+
 from building_simplify.bpe import BPEVocabulary
 from building_simplify.train import evaluate_full_greedy_from_config, train_from_config
 
@@ -39,3 +41,14 @@ def test_one_step_training_checkpoint_and_prediction_output(tmp_path: Path):
     assert checkpoint.exists()
     assert predictions.exists()
     assert metrics["sample_count"] == 2
+    saved = torch.load(checkpoint, map_location="cpu")
+    assert saved["precision"] == "fp32"
+    assert set(saved["scheduler"]) == {"warmup", "cosine"}
+    assert set(saved["random_state"]) >= {"python", "torch_cpu", "dataloader"}
+    assert saved["training_config"]["batch_size"] == 1
+    assert saved["training_config"]["scheduled_sampling_max"] == 0.0
+    resolved_config = output_dir / "resolved_config.json"
+    assert resolved_config.exists()
+    assert len(saved["training_config_sha256"]) == 64
+    metric_rows = [json.loads(line) for line in (output_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert all(row["training_config_sha256"] == saved["training_config_sha256"] for row in metric_rows)

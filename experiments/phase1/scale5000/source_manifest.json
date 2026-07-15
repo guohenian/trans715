@@ -1,0 +1,6 @@
+{
+  "checkpoint_available_locally": false,
+  "checkpoint_sha256": null,
+  "source_log": "runs/简单建筑删除后metrics.jsonl",
+  "note": "Upload the real server checkpoint before filling its SHA-256."
+}
