@@ -1,0 +1,49 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# Editor and local assistant state
+.vscode/
+.idea/
+.claude/
+.codex/
+.superpowers/
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Generated datasets and geospatial source data
+/datasets/
+/洛杉矶建筑数据/
+/洛杉矶建筑处理后/
+/纽约建筑数据/
+/纽约建筑处理后/
+
+# Training and inference outputs
+/runs/
+/output/
+/experiments/**/runs/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+
+# Generated logs and temporary files
+*.log
+*.tmp
+*.temp
+*.partial
+*.bak
+
