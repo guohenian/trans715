@@ -19,6 +19,7 @@ def test_phase2_configs_follow_one_variable_experiment_order():
 
     assert diagnostic["command"] == "train-diagnostic"
     assert diagnostic["max_steps"] == 3000
+    assert diagnostic["epochs"] * ((512 + diagnostic["batch_size"] - 1) // diagnostic["batch_size"]) >= diagnostic["max_steps"]
     assert diagnostic["dropout"] == 0.0
     assert diagnostic["weight_decay"] == 0.0
     assert diagnostic["scheduled_sampling_max"] == 0.0
