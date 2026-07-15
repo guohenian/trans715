@@ -1,10 +1,10 @@
 {
-  "name": "diagnostic",
+  "name": "diagnostic_eos4",
   "command": "train-diagnostic",
-  "requires": "phase1-temporary-baseline",
+  "requires": "diagnostic-eos-late",
   "datasets_root": "datasets",
   "scale": 5000,
-  "output_dir": "experiments/phase2/runs/scale5000/diagnostic",
+  "output_dir": "experiments/phase2/runs/scale5000/diagnostic_eos4",
   "device": "cuda",
   "precision": "bf16",
   "epochs": 137,
@@ -21,6 +21,6 @@
   "lr": 0.0001,
   "weight_decay": 0.0,
   "scheduled_sampling_max": 0.0,
-  "eos_loss_weight": 2.0,
+  "eos_loss_weight": 4.0,
   "length_loss_weight": 0.05
 }

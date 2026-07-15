@@ -514,6 +514,8 @@ def build_parser() -> argparse.ArgumentParser:
         train.add_argument("--lr", type=float, default=1e-4)
         train.add_argument("--weight-decay", type=float, default=0.0 if command == "train-diagnostic" else 0.01)
         train.add_argument("--scheduled-sampling-max", type=float, default=0.0 if command == "train-diagnostic" else 0.25)
+        train.add_argument("--eos-loss-weight", type=float, default=2.0)
+        train.add_argument("--length-loss-weight", type=float, default=0.05)
 
     evaluate = subparsers.add_parser("evaluate")
     evaluate.add_argument("--predictions", type=Path, required=True)
@@ -597,6 +599,8 @@ def main(argv: list[str] | None = None) -> None:
             lr=args.lr,
             weight_decay=args.weight_decay,
             scheduled_sampling_max=args.scheduled_sampling_max,
+            eos_loss_weight=args.eos_loss_weight,
+            length_loss_weight=args.length_loss_weight,
             precision="fp32" if args.no_amp else args.precision,
         )
         print(checkpoint)

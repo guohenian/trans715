@@ -13,6 +13,7 @@ def _load(name: str) -> dict:
 
 def test_phase2_configs_follow_one_variable_experiment_order():
     diagnostic = _load("diagnostic")
+    diagnostic_eos4 = _load("diagnostic_eos4")
     dropout0 = _load("dropout0")
     preln = _load("preln")
     larger = _load("larger")
@@ -23,6 +24,13 @@ def test_phase2_configs_follow_one_variable_experiment_order():
     assert diagnostic["dropout"] == 0.0
     assert diagnostic["weight_decay"] == 0.0
     assert diagnostic["scheduled_sampling_max"] == 0.0
+    assert diagnostic_eos4 == {
+        **diagnostic,
+        "name": "diagnostic_eos4",
+        "requires": "diagnostic-eos-late",
+        "output_dir": "experiments/phase2/runs/scale5000/diagnostic_eos4",
+        "eos_loss_weight": 4.0,
+    }
 
     assert dropout0["command"] == "train-baseline"
     assert dropout0["dropout"] == 0.0
@@ -33,10 +41,12 @@ def test_phase2_configs_follow_one_variable_experiment_order():
 
 
 def test_phase2_scripts_are_isolated_and_use_bf16():
-    names = ["diagnostic", "dropout0", "preln", "larger"]
+    names = ["diagnostic", "diagnostic_eos4", "dropout0", "preln", "larger"]
     contents = [(SCRIPTS / f"run_{name}_5000.sh").read_text(encoding="utf-8") for name in names]
 
     assert all("--precision bf16" in content for content in contents)
-    assert len({line for content in contents for line in content.splitlines() if "--output-dir" in line}) == 4
+    assert len({line for content in contents for line in content.splitlines() if "--output-dir" in line}) == 5
     assert "train-diagnostic" in contents[0]
-    assert all("train-baseline" in content for content in contents[1:])
+    assert "train-diagnostic" in contents[1]
+    assert "checkpoint_epoch_131.pt" in contents[1]
+    assert all("train-baseline" in content for content in contents[2:])
